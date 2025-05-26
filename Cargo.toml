@@ -1,15 +1,17 @@
 [package]
-authors = ["Luca Barbato <lu_zero@gentoo.org>"]
+authors = ["Luca Barbato <lu_zero@gentoo.org>", "Christos Katsakioris"]
 name = "kobject-uevent"
-version = "0.2.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.61.0"
 description = "Netlink kobject uevent packets parser"
 license = "MIT"
-repository = "https://github.com/rust-italia/kobject-uevent"
+repository = "https://github.com/ckatsak/kobject-uevent"
 readme = "README.md"
 
 [dependencies]
-thiserror = "2.0.9"
+compact_str = "0.9.0"
+thiserror = "2.0.12"
 
 [dev-dependencies]
 netlink-sys = "0.8.7"

@@ -16,7 +16,7 @@
 
 use std::process;
 
-use netlink_sys::{protocols::NETLINK_KOBJECT_UEVENT, Socket, SocketAddr};
+use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_KOBJECT_UEVENT};
 
 use kobject_uevent::UEvent;
 

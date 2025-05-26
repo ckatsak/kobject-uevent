@@ -1,55 +1,61 @@
-//! [netlink](https://www.man7.org/linux/man-pages/man7/netlink.7.html) `NETLINK_KOBJECT_UEVENT` packet parser
+//! [Netlink](https://www.man7.org/linux/man-pages/man7/netlink.7.html) `NETLINK_KOBJECT_UEVENT`
+//! packet parser.
 //!
 //! The [uevents](https://www.kernel.org/doc/html/latest/core-api/kobject.html#uevents) are
-//! triggered by `kobject_uevent` and `kobject_uevent_env` to signal a change in the referred kobject.
+//! triggered by `kobject_uevent` and `kobject_uevent_env` to signal a change in the referred
+//! kobject.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::RandomState},
+    hash::BuildHasher,
     io,
     path::{Path, PathBuf},
-    str::{from_utf8, FromStr},
+    str::{self, FromStr},
 };
 
-#[derive(Debug, thiserror::Error)]
+use compact_str::{CompactString, ToCompactString};
+
+#[derive(Debug, ::thiserror::Error)]
 pub enum Error {
-    #[error("Unexpected action: {0}")]
-    UnexpectedAction(String),
-    #[error("Invalid DEVPATH: {0}")]
-    InvalidDevPath(String),
-    #[error("Unexpected SEQNUM: {0}")]
-    InvalidSeqNum(String),
+    #[error("Unexpected ACTION: {0:?}")]
+    UnexpectedAction(CompactString),
+    #[error("Unexpected SEQNUM: {0:?}")]
+    InvalidSeqNum(CompactString),
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("Path not inside mountpoint")]
-    NotInsideMountpoint,
-    #[error("Packet not UTF-8")]
-    NotUtf8,
-    #[error("action not found")]
+    #[error("path is not under sysfs root mountpoint")]
+    NotUnderSysfs,
+    #[error("packet is not valid UTF-8")]
+    InvalidUtf8,
+    #[error("ACTION not found")]
     ActionNotFound,
-    #[error("devpath not found")]
+    #[error("DEVPATH not found")]
     DevPathNotFound,
-    #[error("subsystem not found")]
+    #[error("SUBSYSTEM not found")]
     SubsystemNotFound,
-    #[error("seq missing")]
+    #[error("SEQNUM missing")]
     SeqMissing,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-/// KObject action types
+/// All possible `kobject` actions.
 ///
-/// See kobject_action in include/linux/kobject.h
-pub enum ActionType {
-    /// A new kobject is added
+/// See [`include/linux/kobject.h`][1] (and [`lib/kobject_uevent.c`][2] regarding its parsing).
+///
+/// [1]: https://elixir.bootlin.com/linux/v6.15/source/include/linux/kobject.h#L43-L62
+/// [2]: https://elixir.bootlin.com/linux/v6.15/source/lib/kobject_uevent.c#L49-L59
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum Action {
+    /// A new kobject is added.
     Add,
-    /// A kobject is removed
+    /// A kobject is removed.
     Remove,
-    /// the kobject changed its internal state
+    /// The kobject changed its internal state.
     ///
-    /// the `env` contains kobject-specific information.
+    /// The `env` contains kobject-specific information.
     Change,
-    /// the kobject is reparented as a result of `kobject_move`
+    /// The kobject is reparented as a result of `kobject_move`.
     ///
-    /// the `env` contains `DEVPATH_OLD=<oldpath>`.
+    /// The `env` contains `DEVPATH_OLD=<oldpath>`.
     Move,
     /// The device is back online after successful `device_offline`.
     Online,
@@ -61,134 +67,133 @@ pub enum ActionType {
     Unbind,
 }
 
-impl FromStr for ActionType {
+impl FromStr for Action {
     type Err = Error;
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use ActionType::*;
-        match s {
-            "add" => Ok(Add),
-            "remove" => Ok(Remove),
-            "change" => Ok(Change),
-            "move" => Ok(Move),
-            "online" => Ok(Online),
-            "offline" => Ok(Offline),
-            "bind" => Ok(Bind),
-            "unbind" => Ok(Unbind),
-            _ => Err(Error::UnexpectedAction(s.to_owned())),
-        }
+        Ok(match s {
+            "add" => Action::Add,
+            "remove" => Action::Remove,
+            "change" => Action::Change,
+            "move" => Action::Move,
+            "online" => Action::Online,
+            "offline" => Action::Offline,
+            "bind" => Action::Bind,
+            "unbind" => Action::Unbind,
+            _ => Err(Error::UnexpectedAction(s.to_compact_string()))?,
+        })
     }
 }
 
-/// Linux kernel userspace event
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UEvent {
+/// Linux kernel userspace event.
+#[derive(Debug, Clone, Eq)]
+pub struct UEvent<S: BuildHasher = RandomState> {
     /// Action happening
-    pub action: ActionType,
-    /// Complete Kernel Object path
+    pub action: Action,
+    /// Complete kobject path
     pub devpath: PathBuf,
-    /// SubSystem originating the event
-    pub subsystem: String,
-    /// Arguments
-    pub env: HashMap<String, String>,
+    /// Origin subsystem of the event
+    pub subsystem: CompactString,
+    /// Miscellaneous arguments
+    pub env: HashMap<CompactString, CompactString, S>,
     /// Sequence number
     pub seq: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MaybeUEvent {
+impl<S: BuildHasher> PartialEq for UEvent<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.action.eq(&other.action)
+            && self.seq.eq(&other.seq)
+            && self.subsystem.eq(&other.subsystem)
+            && self.devpath.eq(&other.devpath)
+            && self.env.eq(&other.env)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MaybeUEvent<S: BuildHasher = RandomState> {
     /// Action happening
-    pub action: Option<ActionType>,
+    pub action: Option<Action>,
     /// Complete Kernel Object path
     pub devpath: Option<PathBuf>,
     /// SubSystem originating the event
-    pub subsystem: Option<String>,
+    pub subsystem: Option<CompactString>,
     /// Arguments
-    pub env: HashMap<String, String>,
+    pub env: HashMap<CompactString, CompactString, S>,
     /// Sequence number
     pub seq: Option<u64>,
 }
 
-/// Parse key=value strings as UEvent, some fields may be missing
+/// Parse `key=value` strings as [`UEvent`]. Some fields may be missing.
 fn parse_uevent_iter<'a>(iter: impl Iterator<Item = &'a str>) -> Result<MaybeUEvent, Error> {
-    let mut action = None;
-    let mut devpath = None;
-    let mut subsystem = None;
-    let mut env = HashMap::new();
-    let mut seq = None;
+    let mut ret = MaybeUEvent::default();
 
     for f in iter {
         if let Some((key, value)) = f.split_once('=') {
             match key {
-                "ACTION" => action = Some(value.parse::<ActionType>()?),
+                "ACTION" => ret.action = Some(value.parse::<Action>()?),
                 "DEVPATH" => {
-                    devpath = Some(
-                        value
-                            .parse::<PathBuf>()
-                            .map_err(|_| Error::InvalidDevPath(value.to_owned()))?,
-                    )
+                    ret.devpath = Some(value.parse().expect("PathBuf::from_str is infallible"))
                 }
-                "SUBSYSTEM" => subsystem = Some(value.to_string()),
+                "SUBSYSTEM" => ret.subsystem = Some(value.to_compact_string()),
                 "SEQNUM" => {
-                    seq = Some(
+                    ret.seq = Some(
                         value
                             .parse::<u64>()
-                            .map_err(|_| Error::InvalidSeqNum(value.to_owned()))?,
+                            .map_err(|_| Error::InvalidSeqNum(value.to_compact_string()))?,
                     )
                 }
-                _ => {}
+                _ => {
+                    _ = ret
+                        .env
+                        .insert(key.to_compact_string(), value.to_compact_string())
+                }
             }
-            let _ = env.insert(key.into(), value.into());
         }
     }
 
-    Ok(MaybeUEvent {
-        action,
-        devpath,
-        subsystem,
-        env,
-        seq,
-    })
+    Ok(ret)
 }
 
 impl UEvent {
-    /// Parse a sysfs path as an Add UEvent
+    /// Parse a `sysfs(5)` path as an [`Action::Add`] [`UEvent`].
     pub fn from_sysfs_path(
         path: impl AsRef<Path>,
-        mountpoint: impl AsRef<Path>,
+        sysfs_root: impl AsRef<Path>,
     ) -> Result<UEvent, Error> {
         let path = path.as_ref();
-        let uevent = std::fs::read_to_string(path.join("uevent"))?;
-        let subsystem_path = std::fs::read_link(path.join("subsystem"))?;
+        let uevent = ::std::fs::read_to_string(path.join("uevent"))?;
+        let subsystem_path = ::std::fs::read_link(path.join("subsystem"))?;
         let lines = uevent.lines();
 
         let MaybeUEvent { env, .. } = parse_uevent_iter(lines)?;
 
-        let action = ActionType::Add;
         // make it look like a netlink devpath
         let devpath = Path::new("/").join(
             path.canonicalize()?
-                .strip_prefix(mountpoint)
-                .map_err(|_| Error::NotInsideMountpoint)?,
+                .strip_prefix(sysfs_root)
+                .map_err(|_| Error::NotUnderSysfs)?,
         );
         let subsystem = subsystem_path
             .file_name()
             .ok_or(Error::SubsystemNotFound)?
             .to_string_lossy()
-            .to_string();
-        let seq = 0;
+            .to_compact_string();
 
         Ok(UEvent {
-            action,
+            action: Action::Add,
             devpath,
             subsystem,
             env,
-            seq,
+            seq: 0,
         })
     }
 
-    /// Parse a netlink packet as received from the NETLINK_KOBJECT_UEVENT broadcast
+    /// Parse a netlink packet as received from the `NETLINK_KOBJECT_UEVENT` broadcast.
     pub fn from_netlink_packet(pkt: &[u8]) -> Result<UEvent, Error> {
-        let lines = from_utf8(pkt).map_err(|_| Error::NotUtf8)?.split('\0');
+        let lines = str::from_utf8(pkt)
+            .map_err(|_| Error::InvalidUtf8)?
+            .split('\0');
         let MaybeUEvent {
             action,
             devpath,
@@ -197,17 +202,12 @@ impl UEvent {
             seq,
         } = parse_uevent_iter(lines)?;
 
-        let action = action.ok_or(Error::ActionNotFound)?;
-        let devpath = devpath.ok_or(Error::DevPathNotFound)?;
-        let subsystem = subsystem.ok_or(Error::SubsystemNotFound)?;
-        let seq = seq.ok_or(Error::SeqMissing)?;
-
         Ok(UEvent {
-            action,
-            devpath,
-            subsystem,
+            action: action.ok_or(Error::ActionNotFound)?,
+            devpath: devpath.ok_or(Error::DevPathNotFound)?,
+            subsystem: subsystem.ok_or(Error::SubsystemNotFound)?,
             env,
-            seq,
+            seq: seq.ok_or(Error::SeqMissing)?,
         })
     }
 }
@@ -227,9 +227,9 @@ mod tests {
             UEvent {
                 action: $action,
                 devpath: PathBuf::from($devpath),
-                subsystem: $subsystem.to_string(),
+                subsystem: $subsystem.to_compact_string(),
                 env: IntoIterator::into_iter([
-                    $(($env_name.to_string(), $env_value.to_string())),*
+                    $(($env_name.to_compact_string(), $env_value.to_compact_string())),*
                 ]).collect(),
                 seq: $seq,
             }
@@ -250,18 +250,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Add,
+                action: Action::Add,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "add",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "add",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3469",
+                    //"SEQNUM" => "3469",
                 },
                 seq: 3469
             }
@@ -282,18 +282,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Remove,
+                action: Action::Remove,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "remove",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "remove",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3471",
+                    //"SEQNUM" => "3471",
                 },
                 seq: 3471
             }
@@ -314,18 +314,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Change,
+                action: Action::Change,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "change",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "change",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3472",
+                    //"SEQNUM" => "3472",
                 },
                 seq: 3472
             }
@@ -346,18 +346,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Move,
+                action: Action::Move,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "move",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "move",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3473",
+                    //"SEQNUM" => "3473",
                 },
                 seq: 3473
             }
@@ -378,18 +378,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Online,
+                action: Action::Online,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "online",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "online",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3474",
+                    //"SEQNUM" => "3474",
                 },
                 seq: 3474
             }
@@ -410,18 +410,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Offline,
+                action: Action::Offline,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "offline",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "offline",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3475",
+                    //"SEQNUM" => "3475",
                 },
                 seq: 3475
             }
@@ -442,18 +442,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Bind,
+                action: Action::Bind,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "bind",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "bind",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3476",
+                    //"SEQNUM" => "3476",
                 },
                 seq: 3476
             }
@@ -474,18 +474,18 @@ mod tests {
         assert_eq!(
             UEvent::from_netlink_packet(DATA).unwrap(),
             uevent! {
-                action: ActionType::Unbind,
+                action: Action::Unbind,
                 devpath: "/devices/platform/serial8250/tty/ttyS6",
                 subsystem: "tty",
                 env: {
-                    "ACTION" => "unbind",
-                    "DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
-                    "SUBSYSTEM" => "tty",
+                    //"ACTION" => "unbind",
+                    //"DEVPATH" => "/devices/platform/serial8250/tty/ttyS6",
+                    //"SUBSYSTEM" => "tty",
                     "SYNTH_UUID" => "0",
                     "MAJOR" => "4",
                     "MINOR" => "70",
                     "DEVNAME" => "ttyS6",
-                    "SEQNUM" => "3477",
+                    //"SEQNUM" => "3477",
                 },
                 seq: 3477
             }
