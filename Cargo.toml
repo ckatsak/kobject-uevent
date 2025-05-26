@@ -14,4 +14,5 @@ compact_str = "0.9.0"
 thiserror = "2.0.12"
 
 [dev-dependencies]
-netlink-sys = "0.8.7"
+netlink-sys = { version = "0.8.7", features = ["tokio_socket"] }
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
